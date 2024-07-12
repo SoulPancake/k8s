@@ -232,10 +232,11 @@ func setPodsStatusesWithIndexes(podIndexer cache.Indexer, job *batch.Job, status
 }
 
 type jobInitialStatus struct {
-	active    int
-	succeed   int
-	failed    int
-	startTime *time.Time
+	active     int
+	succeed    int
+	failed     int
+	startTime  *time.Time
+	conditions []batch.JobCondition
 }
 
 func TestControllerSyncJob(t *testing.T) {
@@ -290,6 +291,7 @@ func TestControllerSyncJob(t *testing.T) {
 		podIndexLabelDisabled   bool
 		jobPodReplacementPolicy bool
 		jobPodFailurePolicy     bool
+		jobSuccessPolicy        bool
 	}{
 		"job start": {
 			parallelism:       2,
@@ -1154,6 +1156,70 @@ func TestControllerSyncJob(t *testing.T) {
 			podIndexLabelDisabled:  true,
 			expectedReady:          ptr.To[int32](0),
 		},
+		"FailureTarget=False condition added manually is ignored": {
+			jobPodFailurePolicy: true,
+			parallelism:         1,
+			completions:         1,
+			activePods:          1,
+			readyPods:           1,
+			initialStatus: &jobInitialStatus{
+				active: 1,
+				startTime: func() *time.Time {
+					now := time.Now()
+					return &now
+				}(),
+				conditions: []batch.JobCondition{
+					{
+						Type:    batch.JobFailureTarget,
+						Status:  v1.ConditionFalse,
+						Reason:  "ConditionAddedManually",
+						Message: "Testing",
+					},
+				},
+			},
+			expectedActive: 1,
+			expectedReady:  ptr.To[int32](1),
+			expectedConditions: []batch.JobCondition{
+				{
+					Type:    batch.JobFailureTarget,
+					Status:  v1.ConditionFalse,
+					Reason:  "ConditionAddedManually",
+					Message: "Testing",
+				},
+			},
+		},
+		"SuccessCriteriaMet=False condition added manually is ignored": {
+			jobSuccessPolicy: true,
+			parallelism:      1,
+			completions:      1,
+			activePods:       1,
+			readyPods:        1,
+			initialStatus: &jobInitialStatus{
+				active: 1,
+				startTime: func() *time.Time {
+					now := time.Now()
+					return &now
+				}(),
+				conditions: []batch.JobCondition{
+					{
+						Type:    batch.JobSuccessCriteriaMet,
+						Status:  v1.ConditionFalse,
+						Reason:  "ConditionAddedManually",
+						Message: "Testing",
+					},
+				},
+			},
+			expectedActive: 1,
+			expectedReady:  ptr.To[int32](1),
+			expectedConditions: []batch.JobCondition{
+				{
+					Type:    batch.JobSuccessCriteriaMet,
+					Status:  v1.ConditionFalse,
+					Reason:  "ConditionAddedManually",
+					Message: "Testing",
+				},
+			},
+		},
 	}
 
 	for name, tc := range testCases {
@@ -1162,6 +1228,7 @@ func TestControllerSyncJob(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.PodIndexLabel, !tc.podIndexLabelDisabled)
 			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.JobPodReplacementPolicy, tc.jobPodReplacementPolicy)
 			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.JobPodFailurePolicy, tc.jobPodFailurePolicy)
+			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.JobSuccessPolicy, tc.jobSuccessPolicy)
 			// job manager setup
 			clientSet := clientset.NewForConfigOrDie(&restclient.Config{Host: "", ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
 
@@ -1197,6 +1264,7 @@ func TestControllerSyncJob(t *testing.T) {
 					startTime := metav1.NewTime(*tc.initialStatus.startTime)
 					job.Status.StartTime = &startTime
 				}
+				job.Status.Conditions = append(job.Status.Conditions, tc.initialStatus.conditions...)
 			}
 
 			key, err := controller.KeyFunc(job)
@@ -2709,7 +2777,6 @@ func TestSyncJobWithJobPodFailurePolicy(t *testing.T) {
 
 	testCases := map[string]struct {
 		enableJobPodFailurePolicy     bool
-		enablePodDisruptionConditions bool
 		enableJobPodReplacementPolicy bool
 		job                           batch.Job
 		pods                          []v1.Pod
@@ -3702,42 +3769,8 @@ func TestSyncJobWithJobPodFailurePolicy(t *testing.T) {
 			wantStatusFailed:    1,
 			wantStatusSucceeded: 0,
 		},
-		"terminating Pod considered failed when PodDisruptionConditions is disabled": {
+		"terminating Pod not considered failed when JobPodFailurePolicy is enabled and used": {
 			enableJobPodFailurePolicy: true,
-			job: batch.Job{
-				TypeMeta:   metav1.TypeMeta{Kind: "Job"},
-				ObjectMeta: validObjectMeta,
-				Spec: batch.JobSpec{
-					Parallelism:  ptr.To[int32](1),
-					Selector:     validSelector,
-					Template:     validTemplate,
-					BackoffLimit: ptr.To[int32](0),
-					PodFailurePolicy: &batch.PodFailurePolicy{
-						Rules: []batch.PodFailurePolicyRule{
-							{
-								Action: batch.PodFailurePolicyActionCount,
-								OnPodConditions: []batch.PodFailurePolicyOnPodConditionsPattern{
-									{
-										Type:   v1.DisruptionTarget,
-										Status: v1.ConditionTrue,
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			pods: []v1.Pod{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						DeletionTimestamp: &now,
-					},
-				},
-			},
-		},
-		"terminating Pod not considered failed when PodDisruptionConditions is enabled": {
-			enableJobPodFailurePolicy:     true,
-			enablePodDisruptionConditions: true,
 			job: batch.Job{
 				TypeMeta:   metav1.TypeMeta{Kind: "Job"},
 				ObjectMeta: validObjectMeta,
@@ -3776,7 +3809,6 @@ func TestSyncJobWithJobPodFailurePolicy(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.JobPodFailurePolicy, tc.enableJobPodFailurePolicy)
-			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.PodDisruptionConditions, tc.enablePodDisruptionConditions)
 			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.JobPodReplacementPolicy, tc.enableJobPodReplacementPolicy)
 
 			if tc.job.Spec.PodReplacementPolicy == nil {
